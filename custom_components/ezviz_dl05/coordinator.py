@@ -289,23 +289,95 @@ class EzvizDl05Coordinator(DataUpdateCoordinator[dict[str, Any]]):
         tipo = info.get("type") if isinstance(info.get("type"), str) else None
         return resource_id, local_index, info.get("streamToken"), tipo
 
+    def _bind_code(self) -> str:
+        """bindCode de apertura: firma de la sesion + cliente, como el app.
+
+        El app oficial manda ``s`` + ``aud`` del JWT de su sesion. Se usa el
+        token de la sesion de Home Assistant; si no se puede leer, se cae al
+        bind de terminal de pyezvizapi.
+        """
+        sesion = str(getattr(self.client, "_token", {}).get("session_id") or "")
+        partes = sesion.split(".")
+        if len(partes) == 3:
+            cuerpo = partes[1] + "=" * (-len(partes[1]) % 4)
+            try:
+                datos = json.loads(base64.urlsafe_b64decode(cuerpo))
+            except (binascii.Error, ValueError, UnicodeDecodeError):
+                datos = {}
+            firma, cliente = datos.get("s"), datos.get("aud")
+            if isinstance(firma, str) and isinstance(cliente, str) and firma and cliente:
+                return f"{firma}{cliente}"
+        bind_code, _nombre = self.client.get_latest_terminal_bind(terminal_name=None)
+        return bind_code
+
     async def async_abrir(self) -> None:
-        """Manda el comando de apertura remota."""
-        resource_id, local_index, stream_token, tipo = self._ruta_recurso()
+        """Abre igual que el app EZVIZ: pide un codigo y luego lo usa.
+
+        Flujo capturado del app iOS para el DL05:
+        1. PUT .../DoorLock/<i>/DoorLockMgr/QueryRemoteUnlockRandomCode {"value": {}}
+           -> data.randomCode (lo genera EZVIZ, un solo uso)
+        2. PUT .../DoorLock/<i>/DoorLockMgr/RemoteUnlockReq
+           {"value": {"unLockInfo": {"bindCode", "randomCode", "type": "unLinkIPC", "userName"}}}
+
+        pyezvizapi.remote_unlock usa otro cuerpo (sin "value", con lockNo y
+        sin randomCode) que el DL05 rechaza con meta 400, y ademas devuelve
+        True aunque falle; por eso se llama a los endpoints directamente y se
+        revisa meta.code en cada paso.
+        """
+        recursos = (self.data or {}).get("resourceInfos") or []
+        info = next((r for r in recursos if isinstance(r, dict)), None) or {}
+        recurso = info.get("resourceIdentifier") or "DoorLock"
+        indice = info.get("localIndex")
+        indice = str(indice) if indice is not None else "0"
         usuario = str(getattr(self.client, "_token", {}).get("username") or "")
 
-        def enviar() -> bool:
-            return self.client.remote_unlock(
-                self.serial,
-                usuario,
-                self.lock_no,
-                resource_id=resource_id,
-                local_index=local_index,
-                stream_token=stream_token,
-                lock_type=tipo,
+        base = f"/v3/iot-feature/action/{self.serial}/{recurso}/{indice}/DoorLockMgr"
+
+        def revisar(respuesta: Any, paso: str) -> dict[str, Any]:
+            meta = respuesta.get("meta") if isinstance(respuesta, dict) else None
+            codigo = meta.get("code") if isinstance(meta, dict) else None
+            mensaje = meta.get("message") if isinstance(meta, dict) else None
+            _LOGGER.info("Cerrojo %s: %s -> meta %s %s", self.serial, paso, codigo, mensaje)
+            if codigo != 200:
+                raise PyEzvizError(f"EZVIZ rechazo {paso} (meta {codigo}: {mensaje})")
+            return respuesta
+
+        def enviar() -> None:
+            codigo = revisar(
+                self.client._request_json(  # noqa: SLF001
+                    "PUT",
+                    f"{base}/QueryRemoteUnlockRandomCode",
+                    json_body={"value": {}},
+                    retry_401=True,
+                    max_retries=0,
+                ),
+                "la solicitud de codigo de apertura",
+            )
+            random_code = (codigo.get("data") or {}).get("randomCode")
+            if not random_code:
+                raise PyEzvizError("EZVIZ no entrego codigo de apertura (randomCode)")
+            revisar(
+                self.client._request_json(  # noqa: SLF001
+                    "PUT",
+                    f"{base}/RemoteUnlockReq",
+                    json_body={
+                        "value": {
+                            "unLockInfo": {
+                                "bindCode": self._bind_code(),
+                                "randomCode": str(random_code),
+                                "type": "unLinkIPC",
+                                "userName": usuario,
+                            }
+                        }
+                    },
+                    retry_401=True,
+                    max_retries=0,
+                ),
+                "la apertura remota",
             )
 
         await self.hass.async_add_executor_job(enviar)
+
         if self.estado_nativo:
             # El cerrojo publica su propio estado: se le pregunta a el en vez
             # de suponer que el comando funciono.
