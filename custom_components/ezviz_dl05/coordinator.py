@@ -6,6 +6,7 @@ import base64
 import binascii
 import json
 import logging
+import secrets
 import time
 from datetime import timedelta
 from typing import Any
@@ -13,7 +14,6 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from pyezvizapi import EzvizClient
-from pyezvizapi.constants import FEATURE_CODE
 from pyezvizapi.exceptions import EzvizAuthTokenExpired, PyEzvizError
 
 from .const import (
@@ -290,85 +290,71 @@ class EzvizDl05Coordinator(DataUpdateCoordinator[dict[str, Any]]):
         tipo = info.get("type") if isinstance(info.get("type"), str) else None
         return resource_id, local_index, info.get("streamToken"), tipo
 
-    def _rutas_apertura(self) -> list[tuple[str, str, int]]:
-        """Combinaciones (recurso, indice, lockNo) a probar para abrir.
+    def _bind_code(self) -> str:
+        """bindCode de apertura: firma de la sesion + cliente, como el app.
 
-        pyezvizapi documenta el recurso como "Video" o "DoorLock" (el
-        resourceIdentifier), no el resourceId interno; con el resourceId el
-        DL05 responde meta 400. Se prueban en orden y se para en la primera
-        que EZVIZ acepte.
+        El app oficial manda ``s`` + ``aud`` del JWT de su sesion. Se usa el
+        token de la sesion de Home Assistant; si no se puede leer, se cae al
+        bind de terminal de pyezvizapi.
         """
-        recursos = (self.data or {}).get("resourceInfos") or []
-        info = next((r for r in recursos if isinstance(r, dict)), None) or {}
-        identificador = info.get("resourceIdentifier") or "DoorLock"
-        indice = str(info.get("localIndex") if info.get("localIndex") is not None else "0")
-        cerrojos = [self.lock_no] + [n for n in (1, 2) if n != self.lock_no]
-        rutas: list[tuple[str, str, int]] = []
-        for recurso, idx in ((identificador, indice), ("DoorLock", "0"), ("DoorLock", "1"), ("Video", "1")):
-            for cerrojo in cerrojos:
-                if (recurso, idx, cerrojo) not in rutas:
-                    rutas.append((recurso, idx, cerrojo))
-        return rutas
+        sesion = str(getattr(self.client, "_token", {}).get("session_id") or "")
+        partes = sesion.split(".")
+        if len(partes) == 3:
+            cuerpo = partes[1] + "=" * (-len(partes[1]) % 4)
+            try:
+                datos = json.loads(base64.urlsafe_b64decode(cuerpo))
+            except (binascii.Error, ValueError, UnicodeDecodeError):
+                datos = {}
+            firma, cliente = datos.get("s"), datos.get("aud")
+            if isinstance(firma, str) and isinstance(cliente, str) and firma and cliente:
+                return f"{firma}{cliente}"
+        bind_code, _nombre = self.client.get_latest_terminal_bind(terminal_name=None)
+        return bind_code
 
     async def async_abrir(self) -> None:
-        """Manda el comando de apertura remota y comprueba la respuesta.
+        """Manda la apertura remota igual que el app EZVIZ y revisa la respuesta.
 
-        pyezvizapi.remote_unlock devuelve True aunque EZVIZ conteste meta 400,
-        asi que se llama al endpoint directamente y se revisa meta.code.
+        Formato capturado del app iOS para el DL05:
+        PUT /v3/iot-feature/action/<serial>/DoorLock/<localIndex>/DoorLockMgr/RemoteUnlockReq
+        {"value": {"unLockInfo": {"bindCode", "randomCode", "type": "unLinkIPC", "userName"}}}
+
+        pyezvizapi.remote_unlock usa otro cuerpo (sin "value", con lockNo) que
+        el DL05 rechaza con meta 400, y ademas devuelve True aunque falle.
         """
-        usuario = str(getattr(self.client, "_token", {}).get("username") or "")
-        stream_token = None
-        tipo = None
         recursos = (self.data or {}).get("resourceInfos") or []
         info = next((r for r in recursos if isinstance(r, dict)), None) or {}
-        if isinstance(info.get("streamToken"), str):
-            stream_token = info["streamToken"]
-        if isinstance(info.get("type"), str):
-            tipo = info["type"]
+        recurso = info.get("resourceIdentifier") or "DoorLock"
+        indice = info.get("localIndex")
+        indice = str(indice) if indice is not None else "0"
+        usuario = str(getattr(self.client, "_token", {}).get("username") or "")
 
-        def enviar() -> tuple[str, str, int] | str:
-            try:
-                bind_code, nombre = self.client.get_latest_terminal_bind(terminal_name="Hassio")
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Cerrojo %s: sin bind de terminal (%s), se usa el legado", self.serial, err)
-                bind_code, nombre = f"{FEATURE_CODE}{usuario}", usuario
-            ultimo = ""
-            for recurso, indice, cerrojo in self._rutas_apertura():
-                info_apertura: dict[str, Any] = {
-                    "bindCode": bind_code,
-                    "lockNo": cerrojo,
-                    "streamToken": stream_token or "",
-                    "userName": nombre,
+        def enviar() -> dict[str, Any]:
+            cuerpo = {
+                "value": {
+                    "unLockInfo": {
+                        "bindCode": self._bind_code(),
+                        "randomCode": str(secrets.randbelow(9_000_000_000) + 1_000_000_000),
+                        "type": "unLinkIPC",
+                        "userName": usuario,
+                    }
                 }
-                if tipo:
-                    info_apertura["type"] = tipo
-                respuesta = self.client._request_json(  # noqa: SLF001
-                    "PUT",
-                    f"/v3/iot-feature/action/{self.serial}/{recurso}/{indice}/DoorLockMgr/RemoteUnlockReq",
-                    json_body={"unLockInfo": info_apertura},
-                    retry_401=True,
-                    max_retries=0,
-                )
-                meta = respuesta.get("meta") if isinstance(respuesta, dict) else None
-                codigo = meta.get("code") if isinstance(meta, dict) else None
-                mensaje = meta.get("message") if isinstance(meta, dict) else None
-                _LOGGER.info(
-                    "Cerrojo %s: apertura via %s/%s lockNo=%s -> meta %s %s",
-                    self.serial,
-                    recurso,
-                    indice,
-                    cerrojo,
-                    codigo,
-                    mensaje,
-                )
-                if codigo == 200:
-                    return recurso, indice, cerrojo
-                ultimo = f"meta {codigo}: {mensaje}"
-            return ultimo
+            }
+            return self.client._request_json(  # noqa: SLF001
+                "PUT",
+                f"/v3/iot-feature/action/{self.serial}/{recurso}/{indice}/DoorLockMgr/RemoteUnlockReq",
+                json_body=cuerpo,
+                retry_401=True,
+                max_retries=0,
+            )
 
-        resultado = await self.hass.async_add_executor_job(enviar)
-        if isinstance(resultado, str):
-            raise PyEzvizError(f"EZVIZ rechazo la apertura remota ({resultado})")
+        respuesta = await self.hass.async_add_executor_job(enviar)
+        meta = respuesta.get("meta") if isinstance(respuesta, dict) else None
+        codigo = meta.get("code") if isinstance(meta, dict) else None
+        mensaje = meta.get("message") if isinstance(meta, dict) else None
+        _LOGGER.info("Cerrojo %s: apertura remota -> meta %s %s", self.serial, codigo, mensaje)
+        if codigo != 200:
+            raise PyEzvizError(f"EZVIZ rechazo la apertura remota (meta {codigo}: {mensaje})")
+
         if self.estado_nativo:
             # El cerrojo publica su propio estado: se le pregunta a el en vez
             # de suponer que el comando funciono.
