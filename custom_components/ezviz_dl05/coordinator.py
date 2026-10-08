@@ -6,7 +6,6 @@ import base64
 import binascii
 import json
 import logging
-import secrets
 import time
 from datetime import timedelta
 from typing import Any
@@ -312,14 +311,18 @@ class EzvizDl05Coordinator(DataUpdateCoordinator[dict[str, Any]]):
         return bind_code
 
     async def async_abrir(self) -> None:
-        """Manda la apertura remota igual que el app EZVIZ y revisa la respuesta.
+        """Abre igual que el app EZVIZ: pide un codigo y luego lo usa.
 
-        Formato capturado del app iOS para el DL05:
-        PUT /v3/iot-feature/action/<serial>/DoorLock/<localIndex>/DoorLockMgr/RemoteUnlockReq
-        {"value": {"unLockInfo": {"bindCode", "randomCode", "type": "unLinkIPC", "userName"}}}
+        Flujo capturado del app iOS para el DL05:
+        1. PUT .../DoorLock/<i>/DoorLockMgr/QueryRemoteUnlockRandomCode {"value": {}}
+           -> data.randomCode (lo genera EZVIZ, un solo uso)
+        2. PUT .../DoorLock/<i>/DoorLockMgr/RemoteUnlockReq
+           {"value": {"unLockInfo": {"bindCode", "randomCode", "type": "unLinkIPC", "userName"}}}
 
-        pyezvizapi.remote_unlock usa otro cuerpo (sin "value", con lockNo) que
-        el DL05 rechaza con meta 400, y ademas devuelve True aunque falle.
+        pyezvizapi.remote_unlock usa otro cuerpo (sin "value", con lockNo y
+        sin randomCode) que el DL05 rechaza con meta 400, y ademas devuelve
+        True aunque falle; por eso se llama a los endpoints directamente y se
+        revisa meta.code en cada paso.
         """
         recursos = (self.data or {}).get("resourceInfos") or []
         info = next((r for r in recursos if isinstance(r, dict)), None) or {}
@@ -328,32 +331,52 @@ class EzvizDl05Coordinator(DataUpdateCoordinator[dict[str, Any]]):
         indice = str(indice) if indice is not None else "0"
         usuario = str(getattr(self.client, "_token", {}).get("username") or "")
 
-        def enviar() -> dict[str, Any]:
-            cuerpo = {
-                "value": {
-                    "unLockInfo": {
-                        "bindCode": self._bind_code(),
-                        "randomCode": str(secrets.randbelow(9_000_000_000) + 1_000_000_000),
-                        "type": "unLinkIPC",
-                        "userName": usuario,
-                    }
-                }
-            }
-            return self.client._request_json(  # noqa: SLF001
-                "PUT",
-                f"/v3/iot-feature/action/{self.serial}/{recurso}/{indice}/DoorLockMgr/RemoteUnlockReq",
-                json_body=cuerpo,
-                retry_401=True,
-                max_retries=0,
+        base = f"/v3/iot-feature/action/{self.serial}/{recurso}/{indice}/DoorLockMgr"
+
+        def revisar(respuesta: Any, paso: str) -> dict[str, Any]:
+            meta = respuesta.get("meta") if isinstance(respuesta, dict) else None
+            codigo = meta.get("code") if isinstance(meta, dict) else None
+            mensaje = meta.get("message") if isinstance(meta, dict) else None
+            _LOGGER.info("Cerrojo %s: %s -> meta %s %s", self.serial, paso, codigo, mensaje)
+            if codigo != 200:
+                raise PyEzvizError(f"EZVIZ rechazo {paso} (meta {codigo}: {mensaje})")
+            return respuesta
+
+        def enviar() -> None:
+            codigo = revisar(
+                self.client._request_json(  # noqa: SLF001
+                    "PUT",
+                    f"{base}/QueryRemoteUnlockRandomCode",
+                    json_body={"value": {}},
+                    retry_401=True,
+                    max_retries=0,
+                ),
+                "la solicitud de codigo de apertura",
+            )
+            random_code = (codigo.get("data") or {}).get("randomCode")
+            if not random_code:
+                raise PyEzvizError("EZVIZ no entrego codigo de apertura (randomCode)")
+            revisar(
+                self.client._request_json(  # noqa: SLF001
+                    "PUT",
+                    f"{base}/RemoteUnlockReq",
+                    json_body={
+                        "value": {
+                            "unLockInfo": {
+                                "bindCode": self._bind_code(),
+                                "randomCode": str(random_code),
+                                "type": "unLinkIPC",
+                                "userName": usuario,
+                            }
+                        }
+                    },
+                    retry_401=True,
+                    max_retries=0,
+                ),
+                "la apertura remota",
             )
 
-        respuesta = await self.hass.async_add_executor_job(enviar)
-        meta = respuesta.get("meta") if isinstance(respuesta, dict) else None
-        codigo = meta.get("code") if isinstance(meta, dict) else None
-        mensaje = meta.get("message") if isinstance(meta, dict) else None
-        _LOGGER.info("Cerrojo %s: apertura remota -> meta %s %s", self.serial, codigo, mensaje)
-        if codigo != 200:
-            raise PyEzvizError(f"EZVIZ rechazo la apertura remota (meta {codigo}: {mensaje})")
+        await self.hass.async_add_executor_job(enviar)
 
         if self.estado_nativo:
             # El cerrojo publica su propio estado: se le pregunta a el en vez

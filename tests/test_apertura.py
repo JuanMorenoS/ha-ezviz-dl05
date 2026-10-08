@@ -19,7 +19,11 @@ def _jwt(payload: dict) -> str:
     return f"h.{cuerpo}.f"
 
 
-def _coordinador(respuesta, sesion=None):
+CODIGO_OK = {"meta": {"code": 200}, "data": {"randomCode": "1234567890"}}
+OK = {"meta": {"code": 200}, "data": {}}
+
+
+def _coordinador(respuestas, sesion=None):
     c = object.__new__(EzvizDl05Coordinator)
     c.serial = "BG0000000"
     c.lock_no = 2
@@ -30,7 +34,7 @@ def _coordinador(respuesta, sesion=None):
     c.client = MagicMock()
     c.client._token = {"username": "user@example.com", "session_id": sesion or _jwt({"s": "firma", "aud": "cliente"})}
     c.client.get_latest_terminal_bind.return_value = ("terminalbind", "x")
-    c.client._request_json.return_value = respuesta
+    c.client._request_json.side_effect = respuestas
     c.hass = MagicMock()
     c.hass.async_add_executor_job = AsyncMock(side_effect=lambda f, *a: f(*a))
     c.async_set_updated_data = MagicMock()
@@ -38,28 +42,51 @@ def _coordinador(respuesta, sesion=None):
     return c
 
 
-async def test_apertura_usa_el_formato_del_app():
-    c = _coordinador({"meta": {"code": 200}})
+async def test_apertura_pide_codigo_y_lo_usa():
+    c = _coordinador([CODIGO_OK, OK])
     await c.async_abrir()
-    args, kwargs = c.client._request_json.call_args
-    assert args == ("PUT", "/v3/iot-feature/action/BG0000000/DoorLock/0/DoorLockMgr/RemoteUnlockReq")
-    info = kwargs["json_body"]["value"]["unLockInfo"]
-    assert info["bindCode"] == "firmacliente"
-    assert info["type"] == "unLinkIPC"
-    assert info["userName"] == "user@example.com"
-    assert len(info["randomCode"]) == 10 and info["randomCode"].isdigit()
-    assert "lockNo" not in info
+    pedir, abrir = c.client._request_json.call_args_list
+    base = "/v3/iot-feature/action/BG0000000/DoorLock/0/DoorLockMgr"
+    assert pedir.args == ("PUT", f"{base}/QueryRemoteUnlockRandomCode")
+    assert pedir.kwargs["json_body"] == {"value": {}}
+    assert abrir.args == ("PUT", f"{base}/RemoteUnlockReq")
+    assert abrir.kwargs["json_body"] == {
+        "value": {
+            "unLockInfo": {
+                "bindCode": "firmacliente",
+                "randomCode": "1234567890",
+                "type": "unLinkIPC",
+                "userName": "user@example.com",
+            }
+        }
+    }
     assert c.cerrojo_abierto is True
 
 
 async def test_sin_jwt_usa_bind_de_terminal():
-    c = _coordinador({"meta": {"code": 200}}, sesion="no-es-jwt")
+    c = _coordinador([CODIGO_OK, OK], sesion="no-es-jwt")
     await c.async_abrir()
-    assert c.client._request_json.call_args.kwargs["json_body"]["value"]["unLockInfo"]["bindCode"] == "terminalbind"
+    cuerpo = c.client._request_json.call_args_list[1].kwargs["json_body"]
+    assert cuerpo["value"]["unLockInfo"]["bindCode"] == "terminalbind"
 
 
-async def test_rechazo_lanza_error():
-    c = _coordinador({"meta": {"code": 400, "message": "bad"}})
-    with pytest.raises(PyEzvizError, match="meta 400"):
+async def test_codigo_rechazado_no_intenta_abrir():
+    c = _coordinador([{"meta": {"code": 400, "message": "bad"}}])
+    with pytest.raises(PyEzvizError, match="codigo de apertura.*meta 400"):
+        await c.async_abrir()
+    assert c.client._request_json.call_count == 1
+    assert c.cerrojo_abierto is False
+
+
+async def test_sin_random_code_no_intenta_abrir():
+    c = _coordinador([{"meta": {"code": 200}, "data": {}}])
+    with pytest.raises(PyEzvizError, match="randomCode"):
+        await c.async_abrir()
+    assert c.client._request_json.call_count == 1
+
+
+async def test_apertura_rechazada_lanza_error():
+    c = _coordinador([CODIGO_OK, {"meta": {"code": 400, "message": "bad"}}])
+    with pytest.raises(PyEzvizError, match="apertura remota.*meta 400"):
         await c.async_abrir()
     assert c.cerrojo_abierto is False
