@@ -32,8 +32,14 @@ def _coordinador(respuestas, sesion=None):
     c.cerrojo_abierto = False
     c.momento_apertura = 0.0
     c.client = MagicMock()
-    c.client._token = {"username": "user@example.com", "session_id": sesion or _jwt({"s": "firma", "aud": "cliente"})}
-    c.client.get_latest_terminal_bind.return_value = ("terminalbind", "x")
+    c.client.account = "user@example.com"
+    c.client._token = {"username": "nombre-interno", "session_id": sesion or _jwt({"s": "firma", "aud": "cliente"})}
+    c.client.get_terminals.return_value = {
+        "terminals": [
+            {"sign": "viejo", "userId": "cliente", "name": "iPad", "lastModifytime": "2026-01-01"},
+            {"sign": "iphone", "userId": "cliente", "name": "iPhone", "lastModifytime": "2026-10-01"},
+        ]
+    }
     c.client._request_json.side_effect = respuestas
     c.hass = MagicMock()
     c.hass.async_add_executor_job = AsyncMock(side_effect=lambda f, *a: f(*a))
@@ -63,11 +69,39 @@ async def test_apertura_pide_codigo_y_lo_usa():
     assert c.cerrojo_abierto is True
 
 
-async def test_sin_jwt_usa_bind_de_terminal():
+async def test_sin_jwt_usa_la_terminal_mas_reciente():
     c = _coordinador([CODIGO_OK, OK], sesion="no-es-jwt")
     await c.async_abrir()
     cuerpo = c.client._request_json.call_args_list[1].kwargs["json_body"]
-    assert cuerpo["value"]["unLockInfo"]["bindCode"] == "terminalbind"
+    assert cuerpo["value"]["unLockInfo"]["bindCode"] == "iphonecliente"
+
+
+NO_AUTORIZADA = {
+    "meta": {"code": 98324, "message": "manage failed!", "moreInfo": {"deviceMeta": {"code": "0x00018014"}}},
+    "data": None,
+}
+
+
+async def test_terminal_no_autorizada_prueba_la_siguiente_con_codigo_nuevo():
+    c = _coordinador([CODIGO_OK, NO_AUTORIZADA, CODIGO_OK, OK])
+    await c.async_abrir()
+    llamadas = c.client._request_json.call_args_list
+    assert [l.args[1].rsplit("/", 1)[1] for l in llamadas] == [
+        "QueryRemoteUnlockRandomCode",
+        "RemoteUnlockReq",
+        "QueryRemoteUnlockRandomCode",
+        "RemoteUnlockReq",
+    ]
+    assert llamadas[1].kwargs["json_body"]["value"]["unLockInfo"]["bindCode"] == "firmacliente"
+    assert llamadas[3].kwargs["json_body"]["value"]["unLockInfo"]["bindCode"] == "iphonecliente"
+    assert c.cerrojo_abierto is True
+
+
+async def test_ninguna_terminal_autorizada():
+    c = _coordinador([CODIGO_OK, NO_AUTORIZADA] * 3)
+    with pytest.raises(PyEzvizError, match="manage failed"):
+        await c.async_abrir()
+    assert c.cerrojo_abierto is False
 
 
 async def test_codigo_rechazado_no_intenta_abrir():
@@ -87,6 +121,23 @@ async def test_sin_random_code_no_intenta_abrir():
 
 async def test_apertura_rechazada_lanza_error():
     c = _coordinador([CODIGO_OK, {"meta": {"code": 400, "message": "bad"}}])
-    with pytest.raises(PyEzvizError, match="apertura remota.*meta 400"):
+    with pytest.raises(PyEzvizError, match="apertura remota.*bad"):
+        await c.async_abrir()
+    assert c.cerrojo_abierto is False
+
+
+async def test_error_http_muestra_la_respuesta_de_ezviz():
+    import requests
+
+    respuesta = requests.Response()
+    respuesta.status_code = 400
+    respuesta._content = b'{"meta":{"code":400,"message":"parameter error"}}'
+    try:
+        raise requests.HTTPError(response=respuesta)
+    except requests.HTTPError as causa:
+        error = PyEzvizError()
+        error.__cause__ = causa
+    c = _coordinador([CODIGO_OK, error])
+    with pytest.raises(PyEzvizError, match="parameter error"):
         await c.async_abrir()
     assert c.cerrojo_abierto is False
