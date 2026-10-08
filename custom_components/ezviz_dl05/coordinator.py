@@ -13,6 +13,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from pyezvizapi import EzvizClient
+from pyezvizapi.constants import FEATURE_CODE
 from pyezvizapi.exceptions import EzvizAuthTokenExpired, PyEzvizError
 
 from .const import (
@@ -289,23 +290,85 @@ class EzvizDl05Coordinator(DataUpdateCoordinator[dict[str, Any]]):
         tipo = info.get("type") if isinstance(info.get("type"), str) else None
         return resource_id, local_index, info.get("streamToken"), tipo
 
+    def _rutas_apertura(self) -> list[tuple[str, str, int]]:
+        """Combinaciones (recurso, indice, lockNo) a probar para abrir.
+
+        pyezvizapi documenta el recurso como "Video" o "DoorLock" (el
+        resourceIdentifier), no el resourceId interno; con el resourceId el
+        DL05 responde meta 400. Se prueban en orden y se para en la primera
+        que EZVIZ acepte.
+        """
+        recursos = (self.data or {}).get("resourceInfos") or []
+        info = next((r for r in recursos if isinstance(r, dict)), None) or {}
+        identificador = info.get("resourceIdentifier") or "DoorLock"
+        indice = str(info.get("localIndex") if info.get("localIndex") is not None else "0")
+        cerrojos = [self.lock_no] + [n for n in (1, 2) if n != self.lock_no]
+        rutas: list[tuple[str, str, int]] = []
+        for recurso, idx in ((identificador, indice), ("DoorLock", "0"), ("DoorLock", "1"), ("Video", "1")):
+            for cerrojo in cerrojos:
+                if (recurso, idx, cerrojo) not in rutas:
+                    rutas.append((recurso, idx, cerrojo))
+        return rutas
+
     async def async_abrir(self) -> None:
-        """Manda el comando de apertura remota."""
-        resource_id, local_index, stream_token, tipo = self._ruta_recurso()
+        """Manda el comando de apertura remota y comprueba la respuesta.
+
+        pyezvizapi.remote_unlock devuelve True aunque EZVIZ conteste meta 400,
+        asi que se llama al endpoint directamente y se revisa meta.code.
+        """
         usuario = str(getattr(self.client, "_token", {}).get("username") or "")
+        stream_token = None
+        tipo = None
+        recursos = (self.data or {}).get("resourceInfos") or []
+        info = next((r for r in recursos if isinstance(r, dict)), None) or {}
+        if isinstance(info.get("streamToken"), str):
+            stream_token = info["streamToken"]
+        if isinstance(info.get("type"), str):
+            tipo = info["type"]
 
-        def enviar() -> bool:
-            return self.client.remote_unlock(
-                self.serial,
-                usuario,
-                self.lock_no,
-                resource_id=resource_id,
-                local_index=local_index,
-                stream_token=stream_token,
-                lock_type=tipo,
-            )
+        def enviar() -> tuple[str, str, int] | str:
+            try:
+                bind_code, nombre = self.client.get_latest_terminal_bind(terminal_name="Hassio")
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Cerrojo %s: sin bind de terminal (%s), se usa el legado", self.serial, err)
+                bind_code, nombre = f"{FEATURE_CODE}{usuario}", usuario
+            ultimo = ""
+            for recurso, indice, cerrojo in self._rutas_apertura():
+                info_apertura: dict[str, Any] = {
+                    "bindCode": bind_code,
+                    "lockNo": cerrojo,
+                    "streamToken": stream_token or "",
+                    "userName": nombre,
+                }
+                if tipo:
+                    info_apertura["type"] = tipo
+                respuesta = self.client._request_json(  # noqa: SLF001
+                    "PUT",
+                    f"/v3/iot-feature/action/{self.serial}/{recurso}/{indice}/DoorLockMgr/RemoteUnlockReq",
+                    json_body={"unLockInfo": info_apertura},
+                    retry_401=True,
+                    max_retries=0,
+                )
+                meta = respuesta.get("meta") if isinstance(respuesta, dict) else None
+                codigo = meta.get("code") if isinstance(meta, dict) else None
+                mensaje = meta.get("message") if isinstance(meta, dict) else None
+                _LOGGER.info(
+                    "Cerrojo %s: apertura via %s/%s lockNo=%s -> meta %s %s",
+                    self.serial,
+                    recurso,
+                    indice,
+                    cerrojo,
+                    codigo,
+                    mensaje,
+                )
+                if codigo == 200:
+                    return recurso, indice, cerrojo
+                ultimo = f"meta {codigo}: {mensaje}"
+            return ultimo
 
-        await self.hass.async_add_executor_job(enviar)
+        resultado = await self.hass.async_add_executor_job(enviar)
+        if isinstance(resultado, str):
+            raise PyEzvizError(f"EZVIZ rechazo la apertura remota ({resultado})")
         if self.estado_nativo:
             # El cerrojo publica su propio estado: se le pregunta a el en vez
             # de suponer que el comando funciono.
