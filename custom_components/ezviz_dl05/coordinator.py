@@ -329,7 +329,11 @@ class EzvizDl05Coordinator(DataUpdateCoordinator[dict[str, Any]]):
         recurso = info.get("resourceIdentifier") or "DoorLock"
         indice = info.get("localIndex")
         indice = str(indice) if indice is not None else "0"
-        usuario = str(getattr(self.client, "_token", {}).get("username") or "")
+        # El app manda el identificador con el que se inicia sesion (el email),
+        # no loginUser.username, que es un nombre interno de la cuenta.
+        usuario = str(
+            getattr(self.client, "account", None) or getattr(self.client, "_token", {}).get("username") or ""
+        )
 
         base = f"/v3/iot-feature/action/{self.serial}/{recurso}/{indice}/DoorLockMgr"
 
@@ -342,37 +346,42 @@ class EzvizDl05Coordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise PyEzvizError(f"EZVIZ rechazo {paso} (meta {codigo}: {mensaje})")
             return respuesta
 
+        def pedir(ruta: str, cuerpo: dict[str, Any], paso: str) -> dict[str, Any]:
+            try:
+                respuesta = self.client._request_json(  # noqa: SLF001
+                    "PUT", f"{base}/{ruta}", json_body=cuerpo, retry_401=True, max_retries=0
+                )
+            except PyEzvizError as err:
+                causa = err.__cause__
+                detalle = getattr(getattr(causa, "response", None), "text", "") or str(causa or err)
+                _LOGGER.warning("Cerrojo %s: %s fallo: %s", self.serial, paso, detalle[:500])
+                raise PyEzvizError(f"EZVIZ rechazo {paso}: {detalle[:200]}") from err
+            return revisar(respuesta, paso)
+
         def enviar() -> None:
-            codigo = revisar(
-                self.client._request_json(  # noqa: SLF001
-                    "PUT",
-                    f"{base}/QueryRemoteUnlockRandomCode",
-                    json_body={"value": {}},
-                    retry_401=True,
-                    max_retries=0,
-                ),
-                "la solicitud de codigo de apertura",
-            )
+            codigo = pedir("QueryRemoteUnlockRandomCode", {"value": {}}, "la solicitud de codigo de apertura")
             random_code = (codigo.get("data") or {}).get("randomCode")
             if not random_code:
                 raise PyEzvizError("EZVIZ no entrego codigo de apertura (randomCode)")
-            revisar(
-                self.client._request_json(  # noqa: SLF001
-                    "PUT",
-                    f"{base}/RemoteUnlockReq",
-                    json_body={
-                        "value": {
-                            "unLockInfo": {
-                                "bindCode": self._bind_code(),
-                                "randomCode": str(random_code),
-                                "type": "unLinkIPC",
-                                "userName": usuario,
-                            }
+            bind_code = self._bind_code()
+            _LOGGER.debug(
+                "Cerrojo %s: apertura con bindCode de %d caracteres y userName %s",
+                self.serial,
+                len(bind_code),
+                (usuario[:2] + "***" + usuario[usuario.find("@") :]) if "@" in usuario else "***",
+            )
+            pedir(
+                "RemoteUnlockReq",
+                {
+                    "value": {
+                        "unLockInfo": {
+                            "bindCode": bind_code,
+                            "randomCode": str(random_code),
+                            "type": "unLinkIPC",
+                            "userName": usuario,
                         }
-                    },
-                    retry_401=True,
-                    max_retries=0,
-                ),
+                    }
+                },
                 "la apertura remota",
             )
 

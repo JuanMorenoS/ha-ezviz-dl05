@@ -32,7 +32,8 @@ def _coordinador(respuestas, sesion=None):
     c.cerrojo_abierto = False
     c.momento_apertura = 0.0
     c.client = MagicMock()
-    c.client._token = {"username": "user@example.com", "session_id": sesion or _jwt({"s": "firma", "aud": "cliente"})}
+    c.client.account = "user@example.com"
+    c.client._token = {"username": "nombre-interno", "session_id": sesion or _jwt({"s": "firma", "aud": "cliente"})}
     c.client.get_latest_terminal_bind.return_value = ("terminalbind", "x")
     c.client._request_json.side_effect = respuestas
     c.hass = MagicMock()
@@ -88,5 +89,22 @@ async def test_sin_random_code_no_intenta_abrir():
 async def test_apertura_rechazada_lanza_error():
     c = _coordinador([CODIGO_OK, {"meta": {"code": 400, "message": "bad"}}])
     with pytest.raises(PyEzvizError, match="apertura remota.*meta 400"):
+        await c.async_abrir()
+    assert c.cerrojo_abierto is False
+
+
+async def test_error_http_muestra_la_respuesta_de_ezviz():
+    import requests
+
+    respuesta = requests.Response()
+    respuesta.status_code = 400
+    respuesta._content = b'{"meta":{"code":400,"message":"parameter error"}}'
+    try:
+        raise requests.HTTPError(response=respuesta)
+    except requests.HTTPError as causa:
+        error = PyEzvizError()
+        error.__cause__ = causa
+    c = _coordinador([CODIGO_OK, error])
+    with pytest.raises(PyEzvizError, match="parameter error"):
         await c.async_abrir()
     assert c.cerrojo_abierto is False
