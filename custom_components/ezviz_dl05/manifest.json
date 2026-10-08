@@ -1,13 +1,17 @@
 {
   "domain": "ezviz_dl05",
   "name": "EZVIZ DL05 Lock",
-  "version": "0.1.0",
-  "documentation": "https://github.com/JOSDEAD/ha-ezviz-dl05",
-  "issue_tracker": "https://github.com/JOSDEAD/ha-ezviz-dl05/issues",
-  "codeowners": ["@JOSDEAD"],
-  "dependencies": [],
-  "requirements": ["pyezvizapi>=1.0.5.0"],
+  "codeowners": [
+    "@JOSDEAD"
+  ],
   "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/JOSDEAD/ha-ezviz-dl05",
   "integration_type": "device",
-  "iot_class": "cloud_polling"
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/JOSDEAD/ha-ezviz-dl05/issues",
+  "requirements": [
+    "pyezvizapi>=1.0.5.0"
+  ],
+  "version": "0.1.0"
 }

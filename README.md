@@ -133,8 +133,20 @@ eventos usan otras frases. Son raices en minusculas, comparadas por subcadena.
 
 ## Paso 4: instalar
 
+### Con HACS (recomendado)
+
+[![Abrir en HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=JOSDEAD&repository=ha-ezviz-dl05&category=integration)
+
+1. En HACS, menu de tres puntos -> **Repositorios personalizados**.
+2. Agrega `https://github.com/JOSDEAD/ha-ezviz-dl05` con la categoria **Integracion**.
+3. Busca **EZVIZ DL05 Lock**, descargala y reinicia Home Assistant.
+
+### Manual
+
 Copia la carpeta `custom_components/ezviz_dl05/` dentro de la carpeta
-`config/custom_components/` de tu Home Assistant y reinicia. Luego
+`config/custom_components/` de tu Home Assistant y reinicia.
+
+Despues, en ambos casos:
 **Ajustes -> Dispositivos y servicios -> Anadir integracion -> EZVIZ DL05**.
 
 Pide correo, contrasena, serial y region. A diferencia de la integracion del
